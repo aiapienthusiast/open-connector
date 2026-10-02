@@ -2,58 +2,44 @@ import type { CredentialValidators, ProviderExecutors, ProviderProxyExecutor } f
 import type { ProviderActionHandlers } from "../provider-runtime.ts";
 import type { ApiKeyProviderContext } from "../provider-runtime.ts";
 
-import { compactObject, optionalString } from "../../core/cast.ts";
+import { compactObject, looseArray, optionalRecord, optionalString } from "../../core/cast.ts";
 import {
   defineApiKeyProviderExecutors,
   defineProviderProxy,
+  isAbortLikeError,
   ProviderRequestError,
   providerUserAgent,
+  runProviderRequest,
 } from "../provider-runtime.ts";
 
 const service = "cheaperinference";
 const cheaperinferenceApiBaseUrl = "https://api.cheaperinference.com/v1";
 const anthropicApiVersion = "2023-06-01";
+const requestLabel = "Cheaper Inference";
 
-type QueryValue = string | number | boolean | undefined;
 type ActionHandler = (input: Record<string, unknown>, context: ApiKeyProviderContext) => Promise<unknown>;
+type CheaperinferenceRequestContext = Pick<ApiKeyProviderContext, "apiKey" | "fetcher" | "signal">;
 
-interface CheaperinferenceRequestInput {
-  method?: "GET" | "POST";
+interface CheaperinferenceInferenceInput {
   path: string;
-  query?: Record<string, QueryValue>;
-  body?: Record<string, unknown>;
+  body: Record<string, unknown>;
   anthropicVersion?: string;
-  mode?: "validate" | "execute";
 }
 
 const cheaperinferenceActionHandlers: ProviderActionHandlers<"cheaperinference", ActionHandler> = {
   create_chat_completion(input, context) {
     assertStreamingDisabled(input);
-    return cheaperinferenceRequest(
-      context.apiKey,
-      {
-        method: "POST",
-        path: "/chat/completions",
-        body: compactObject(input),
-      },
-      context,
-    );
+    return cheaperinferenceInferenceRequest({ path: "/chat/completions", body: compactObject(input) }, context);
   },
   create_message(input, context) {
     assertStreamingDisabled(input);
-    return cheaperinferenceRequest(
-      context.apiKey,
-      {
-        method: "POST",
-        path: "/messages",
-        body: compactObject(input),
-        anthropicVersion: anthropicApiVersion,
-      },
+    return cheaperinferenceInferenceRequest(
+      { path: "/messages", body: compactObject(input), anthropicVersion: anthropicApiVersion },
       context,
     );
   },
   list_models(_input, context) {
-    return cheaperinferenceRequest(context.apiKey, { path: "/models" }, context);
+    return listCheaperinferenceModels(context, "execute");
   },
 };
 
@@ -68,20 +54,9 @@ export const proxy: ProviderProxyExecutor = defineProviderProxy({
 
 export const credentialValidators: CredentialValidators = {
   async apiKey(input, { fetcher, signal }) {
-    const payload = (await cheaperinferenceRequest(
-      input.apiKey,
-      {
-        path: "/models",
-        mode: "validate",
-      },
-      {
-        apiKey: input.apiKey,
-        fetcher,
-        signal,
-      },
-    )) as {
-      data?: Array<{ id?: unknown }>;
-    };
+    const payload = optionalRecord(
+      await listCheaperinferenceModels({ apiKey: input.apiKey, fetcher, signal }, "validate"),
+    );
 
     return {
       profile: {
@@ -90,39 +65,53 @@ export const credentialValidators: CredentialValidators = {
       grantedScopes: [],
       metadata: {
         validationEndpoint: "/models",
-        availableModels: (payload.data ?? [])
-          .map((model) => model.id)
-          .filter((model): model is string => typeof model === "string"),
+        availableModels: looseArray(payload?.data)
+          .map((model) => optionalString(optionalRecord(model)?.id))
+          .filter((model): model is string => model !== undefined),
       },
     };
   },
 };
 
-async function cheaperinferenceRequest(
-  apiKey: string,
-  input: CheaperinferenceRequestInput,
-  context: Pick<ApiKeyProviderContext, "apiKey" | "fetcher" | "signal">,
+function listCheaperinferenceModels(
+  context: CheaperinferenceRequestContext,
+  mode: "validate" | "execute",
 ): Promise<unknown> {
-  const url = buildCheaperinferenceUrl(input.path, input.query ?? {});
+  return runProviderRequest({ signal: context.signal, label: requestLabel }, async (signal) => {
+    const response = await context.fetcher(`${cheaperinferenceApiBaseUrl}/models`, {
+      method: "GET",
+      headers: buildCheaperinferenceHeaders(context.apiKey, false),
+      signal,
+    });
+    return readCheaperinferenceResponse(response, mode);
+  });
+}
+
+// Inference is intentionally not capped by the shared 30 second provider timeout, because long
+// completions routinely take longer. Only the caller signal bounds it.
+async function cheaperinferenceInferenceRequest(
+  input: CheaperinferenceInferenceInput,
+  context: CheaperinferenceRequestContext,
+): Promise<unknown> {
   let response: Response;
   try {
-    response = await context.fetcher(url, {
-      method: input.method ?? "GET",
-      headers: buildCheaperinferenceHeaders(apiKey, input.body != null, input.anthropicVersion),
-      body: input.body == null ? undefined : JSON.stringify(input.body),
+    response = await context.fetcher(`${cheaperinferenceApiBaseUrl}${input.path}`, {
+      method: "POST",
+      headers: buildCheaperinferenceHeaders(context.apiKey, true, input.anthropicVersion),
+      body: JSON.stringify(input.body),
       signal: context.signal,
     });
   } catch (error) {
+    if (isAbortLikeError(error)) {
+      throw new ProviderRequestError(504, `${requestLabel} request timed out`);
+    }
     throw new ProviderRequestError(
       502,
-      error instanceof Error
-        ? `Cheaper Inference request failed: ${error.message}`
-        : "Cheaper Inference request failed",
+      error instanceof Error ? `${requestLabel} request failed: ${error.message}` : `${requestLabel} request failed`,
     );
   }
 
-  await assertCheaperinferenceResponse(response, input.mode ?? "execute");
-  return response.json() as Promise<unknown>;
+  return readCheaperinferenceResponse(response, "execute");
 }
 
 function buildCheaperinferenceHeaders(
@@ -145,19 +134,18 @@ function buildCheaperinferenceHeaders(
   return headers;
 }
 
-function buildCheaperinferenceUrl(path: string, query: Record<string, QueryValue>): string {
-  const url = new URL(`${cheaperinferenceApiBaseUrl}${path}`);
-  for (const [key, value] of Object.entries(query)) {
-    if (value !== undefined) {
-      url.searchParams.set(key, String(value));
-    }
-  }
-  return url.toString();
-}
-
 function assertStreamingDisabled(input: Record<string, unknown>): void {
   if (input.stream === true) {
     throw new ProviderRequestError(400, "stream=true is not supported by connector actions");
+  }
+}
+
+async function readCheaperinferenceResponse(response: Response, mode: "validate" | "execute"): Promise<unknown> {
+  await assertCheaperinferenceResponse(response, mode);
+  try {
+    return await response.json();
+  } catch {
+    throw new ProviderRequestError(502, `${requestLabel} returned malformed JSON`);
   }
 }
 
@@ -189,11 +177,11 @@ async function readCheaperinferenceError(response: Response): Promise<{
   message: string;
 }> {
   const rawText =
-    (await response.text().catch(() => "")) || `Cheaper Inference request failed with status ${response.status}`;
+    (await response.text().catch(() => "")) || `${requestLabel} request failed with status ${response.status}`;
 
   try {
     const payload = JSON.parse(rawText) as Record<string, unknown>;
-    const nestedError = optionalRecordFrom(payload.error);
+    const nestedError = optionalRecord(payload.error);
 
     return {
       type: optionalString(nestedError?.type) ?? optionalString(payload.type) ?? "provider_error",
@@ -210,11 +198,4 @@ async function readCheaperinferenceError(response: Response): Promise<{
 
 function readErrorCode(value: unknown): string | number | undefined {
   return typeof value === "string" || typeof value === "number" ? value : undefined;
-}
-
-function optionalRecordFrom(value: unknown): Record<string, unknown> | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return undefined;
-  }
-  return value as Record<string, unknown>;
 }
