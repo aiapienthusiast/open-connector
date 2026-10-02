@@ -16,6 +16,8 @@ const service = "cheaperinference";
 const cheaperinferenceApiBaseUrl = "https://api.cheaperinference.com/v1";
 const anthropicApiVersion = "2023-06-01";
 const requestLabel = "Cheaper Inference";
+// Long completions routinely exceed the shared 30 second provider timeout.
+const inferenceRequestTimeoutMs = 300_000;
 
 type ActionHandler = (input: Record<string, unknown>, context: ApiKeyProviderContext) => Promise<unknown>;
 type CheaperinferenceRequestContext = Pick<ApiKeyProviderContext, "apiKey" | "fetcher" | "signal">;
@@ -87,31 +89,22 @@ function listCheaperinferenceModels(
   });
 }
 
-// Inference is intentionally not capped by the shared 30 second provider timeout, because long
-// completions routinely take longer. Only the caller signal bounds it.
-async function cheaperinferenceInferenceRequest(
+function cheaperinferenceInferenceRequest(
   input: CheaperinferenceInferenceInput,
   context: CheaperinferenceRequestContext,
 ): Promise<unknown> {
-  let response: Response;
-  try {
-    response = await context.fetcher(`${cheaperinferenceApiBaseUrl}${input.path}`, {
-      method: "POST",
-      headers: buildCheaperinferenceHeaders(context.apiKey, true, input.anthropicVersion),
-      body: JSON.stringify(input.body),
-      signal: context.signal,
-    });
-  } catch (error) {
-    if (isAbortLikeError(error)) {
-      throw new ProviderRequestError(504, `${requestLabel} request timed out`);
-    }
-    throw new ProviderRequestError(
-      502,
-      error instanceof Error ? `${requestLabel} request failed: ${error.message}` : `${requestLabel} request failed`,
-    );
-  }
-
-  return readCheaperinferenceResponse(response, "execute");
+  return runProviderRequest(
+    { signal: context.signal, label: requestLabel, timeoutMs: inferenceRequestTimeoutMs },
+    async (signal) => {
+      const response = await context.fetcher(`${cheaperinferenceApiBaseUrl}${input.path}`, {
+        method: "POST",
+        headers: buildCheaperinferenceHeaders(context.apiKey, true, input.anthropicVersion),
+        body: JSON.stringify(input.body),
+        signal,
+      });
+      return readCheaperinferenceResponse(response, "execute");
+    },
+  );
 }
 
 function buildCheaperinferenceHeaders(
