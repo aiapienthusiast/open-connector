@@ -144,7 +144,10 @@ async function readCheaperinferenceResponse(response: Response, mode: "validate"
   await assertCheaperinferenceResponse(response, mode);
   try {
     return await response.json();
-  } catch {
+  } catch (error) {
+    if (isAbortLikeError(error)) {
+      throw new ProviderRequestError(504, `${requestLabel} request timed out`);
+    }
     throw new ProviderRequestError(502, `${requestLabel} returned malformed JSON`);
   }
 }
